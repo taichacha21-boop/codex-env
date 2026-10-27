@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.formula import ArrayFormula
 
 import main
 
@@ -616,6 +617,185 @@ class StockTests(unittest.TestCase):
             self.assertEqual(wb["処理履歴"]["A2"].value, "=1+1")
             self.assertEqual(wb["処理履歴"]["A2"].data_type, "s")
             self.assertEqual(wb["処理履歴"]["B2"].data_type, "s")
+
+    def test_array_formula_anchor_and_numeric_range_cells_are_not_updated(self):
+        formula = "=SEQUENCE(2)"
+        def change(wb):
+            wb["商品マスタ"]["C2"] = ArrayFormula(ref="C2:C3", text=formula)
+        self.edit_master(change)
+        folder = self.folder([record(), record(slip="ARRAY_CHILD", code="00408"), record(slip="GOOD", code="00999")])
+        original_hashes = {path: digest(path) for path in (self.master, folder / "data.csv")}
+        first = main.update_stock(self.master, folder, "first")
+        self.assert_success(first)
+        self.assertEqual(first.applied_count, 1)
+        self.assertEqual(first.errors, [])
+        self.assertEqual([(issue.source_file, issue.row) for issue in first.warnings], [("data.csv", 2), ("data.csv", 3)])
+        self.assertEqual(len(self.history(first.output_path)), 2)
+        with closing(load_workbook(first.output_path)) as wb:
+            self.assertEqual(wb["商品マスタ"].array_formulae, {"C2": "C2:C3"})
+            self.assertEqual(wb["商品マスタ"]["C2"].value.text, formula)
+            self.assertEqual(wb["商品マスタ"]["C3"].value, 20)
+            self.assertEqual(wb["商品マスタ"]["C4"].value, 7)
+            for row in (2, 3):
+                for column in (3, 6):
+                    cell = wb["集計"].cell(row, column)
+                    self.assertEqual(cell.value, formula)
+                    self.assertEqual(cell.data_type, "s")
+                self.assertEqual(wb["集計"].cell(row, 7).value, "現在庫が数式のため未更新")
+        second = main.update_stock(first.output_path, folder, "continue")
+        self.assert_success(second)
+        self.assertEqual((second.applied_count, second.duplicate_count), (0, 1))
+        self.assertEqual(self.history(first.output_path), self.history(second.output_path))
+        with closing(load_workbook(second.output_path)) as wb:
+            self.assertEqual(wb["商品マスタ"]["C3"].value, 20)
+            self.assertEqual(wb["商品マスタ"]["C4"].value, 7)
+        self.assertEqual(original_hashes, {path: digest(path) for path in original_hashes})
+
+    def test_array_formula_blank_range_cell_is_excluded_with_warning(self):
+        def change(wb):
+            wb["商品マスタ"]["C2"] = ArrayFormula(ref="C2:C3", text="=SEQUENCE(2)")
+            wb["商品マスタ"]["C3"] = None
+        self.edit_master(change)
+        result = main.update_stock(self.master, self.folder([record(code="00408")]), "first")
+        self.assert_success(result)
+        self.assertEqual((result.applied_count, len(result.errors), len(result.warnings)), (0, 0, 2))
+        self.assertEqual(len(self.history(result.output_path)), 1)
+        with closing(load_workbook(result.output_path)) as wb:
+            self.assertIsNone(wb["商品マスタ"]["C3"].value)
+            self.assertEqual(wb["集計"]["C3"].value, "=SEQUENCE(2)")
+            self.assertEqual(wb["集計"]["C3"].data_type, "s")
+
+    def test_array_formula_anchor_outside_stock_column_protects_stock_range(self):
+        def change(wb):
+            wb["商品マスタ"]["B2"] = ArrayFormula(ref="B2:D3", text="=SEQUENCE(2,3)")
+        self.edit_master(change)
+        result = main.update_stock(self.master, self.folder([record(), record(slip="CHILD", code="00408")]), "first")
+        self.assert_success(result)
+        self.assertEqual((result.applied_count, len(result.errors), len(result.warnings)), (0, 0, 2))
+        self.assertEqual(len(self.history(result.output_path)), 1)
+        with closing(load_workbook(result.output_path)) as wb:
+            self.assertEqual(wb["商品マスタ"].array_formulae, {"B2": "B2:D3"})
+            self.assertEqual(wb["商品マスタ"]["B2"].value.text, "=SEQUENCE(2,3)")
+            for coordinate, value in (("C2", 100), ("C3", 20), ("D2", 120), ("D3", 350)):
+                self.assertEqual(wb["商品マスタ"][coordinate].value, value)
+            self.assertEqual(wb["集計"]["B2"].value, "=SEQUENCE(2,3)")
+            for coordinate in ("B2", "C2", "F2", "C3", "F3"):
+                self.assertEqual(wb["集計"][coordinate].data_type, "s")
+
+    def test_key_length_limit_rejects_long_values_without_truncating_or_colliding(self):
+        prefix = "K" * 32767
+        for field in (0, 1):
+            with self.subTest(field=HEADERS[field]):
+                rows = []
+                for key in (prefix, prefix + "A", prefix + "B"):
+                    row = record()
+                    row[field] = key
+                    rows.append(row)
+                rows.append(record(slip="GOOD"))
+                folder = self.folder(rows)
+                before = digest(folder / "data.csv")
+                first = main.update_stock(self.master, folder, "first")
+                self.assert_success(first)
+                self.assertEqual((first.applied_count, len(first.errors)), (2, 2))
+                self.assertEqual([issue.row for issue in first.errors], [3, 4])
+                self.assertTrue(all("32767" in issue.message for issue in first.errors))
+                history = self.history(first.output_path)
+                self.assertEqual(len(history), 3)
+                self.assertEqual(history[1][field], prefix)
+                self.assertEqual(len(history[1][field]), 32767)
+                second = main.update_stock(first.output_path, folder, "continue")
+                self.assert_success(second)
+                self.assertEqual((second.applied_count, second.duplicate_count, len(second.errors)), (0, 2, 2))
+                self.assertEqual(self.history(second.output_path), history)
+                self.assertEqual(self.stocks(second.output_path)["00125"], 110)
+                self.assertEqual(digest(folder / "data.csv"), before)
+
+    def test_overlong_history_key_stops_before_saving(self):
+        first = main.update_stock(self.master, self.folder([record()]), "first")
+        self.assert_success(first)
+        for column in (1, 2):
+            with self.subTest(column=column):
+                broken = self.base / f"long_history_{column}.xlsx"
+                shutil.copyfile(first.output_path, broken)
+                # 通常のsetterの切り詰めを避け、長すぎる値を持つ破損履歴を構築。
+                self.edit_master(lambda wb: setattr(wb["処理履歴"].cell(2, column), "_value", "K" * 32768), broken)
+                with closing(load_workbook(broken)) as wb:
+                    self.assertEqual(len(wb["処理履歴"].cell(2, column).value), 32768)
+                before = digest(broken)
+                result = main.update_stock(broken, self.folder([record(slip="NEW")]), "continue")
+                self.assert_stopped(result, "32767")
+                self.assertEqual(self.outputs(), {first.output_path})
+                self.assertEqual(digest(broken), before)
+
+    def test_oversized_quantities_are_row_errors_without_rounded_history(self):
+        for quantity in (10**15, 9007199254740993, 99999999999999999, 10**100):
+            with self.subTest(quantity=quantity):
+                folder = self.folder([record(quantity=str(quantity)), record(slip="GOOD")])
+                first = main.update_stock(self.master, folder, "first")
+                self.assert_success(first)
+                self.assertEqual((first.applied_count, len(first.errors)), (1, 1))
+                self.assertEqual((first.errors[0].source_file, first.errors[0].row), ("data.csv", 2))
+                self.assertIn("999999999999999", first.errors[0].message)
+                self.assertEqual(self.stocks(first.output_path)["00125"], 105)
+                self.assertEqual(len(self.history(first.output_path)), 2)
+                self.assertEqual(self.history(first.output_path)[1][0], "GOOD")
+                second = main.update_stock(first.output_path, folder, "continue")
+                self.assert_success(second)
+                self.assertEqual((second.applied_count, second.duplicate_count, len(second.errors)), (0, 1, 1))
+                self.assertEqual(self.history(first.output_path), self.history(second.output_path))
+
+    def test_maximum_quantity_survives_save_reload_and_continue_exactly(self):
+        maximum = 999999999999999
+        self.edit_master(lambda wb: setattr(wb["商品マスタ"]["C2"], "value", 0))
+        for kind, expected in (("入庫", maximum), ("出庫", -maximum)):
+            with self.subTest(kind=kind):
+                folder = self.folder([record(kind=kind, quantity=str(maximum))])
+                first = main.update_stock(self.master, folder, "first")
+                self.assert_success(first)
+                self.assertEqual(first.errors, [])
+                self.assertEqual(first.applied_count, 1)
+                self.assertEqual(self.stocks(first.output_path)["00125"], expected)
+                quantity = self.history(first.output_path)[1][5]
+                self.assertIsInstance(quantity, int)
+                self.assertEqual(quantity, maximum)
+                with closing(load_workbook(first.output_path)) as wb:
+                    self.assertEqual(wb["集計"]["F2"].value, expected)
+                    self.assertEqual(wb["集計"]["D2" if kind == "入庫" else "E2"].value, maximum)
+                second = main.update_stock(first.output_path, folder, "continue")
+                self.assert_success(second)
+                self.assertEqual((second.applied_count, second.duplicate_count), (0, 1))
+                self.assertEqual(self.stocks(second.output_path)["00125"], expected)
+                self.assertEqual(self.history(first.output_path), self.history(second.output_path))
+
+    def test_aggregate_over_safe_integer_range_aborts_without_partial_output(self):
+        self.edit_master(lambda wb: setattr(wb["商品マスタ"]["C2"], "value", 0))
+        folder = self.folder([record(quantity="999999999999999"), record(slip="OVER", quantity="1"), record(slip="OTHER", code="00408")])
+        before = digest(self.master)
+        result = main.update_stock(self.master, folder, "first")
+        self.assert_stopped(result, "整数範囲")
+        self.assertEqual(self.outputs(), set())
+        self.assertEqual(digest(self.master), before)
+
+    def test_final_stock_over_safe_integer_range_aborts_without_partial_output(self):
+        for initial, kind in ((999999999999999, "入庫"), (-999999999999999, "出庫")):
+            with self.subTest(initial=initial):
+                self.edit_master(lambda wb: setattr(wb["商品マスタ"]["C2"], "value", initial))
+                folder = self.folder([record(kind=kind, quantity="1"), record(slip="OTHER", code="00408")])
+                before = digest(self.master)
+                result = main.update_stock(self.master, folder, "first")
+                self.assert_stopped(result, "整数範囲")
+                self.assertEqual(self.outputs(), set())
+                self.assertEqual(digest(self.master), before)
+
+    def test_oversized_quantity_in_history_is_fatal(self):
+        first = main.update_stock(self.master, self.folder([record()]), "first")
+        self.assert_success(first)
+        self.edit_master(lambda wb: setattr(wb["処理履歴"]["F2"], "value", 10**15), first.output_path)
+        before = digest(first.output_path)
+        result = main.update_stock(first.output_path, self.folder([record(slip="NEW")]), "continue")
+        self.assert_stopped(result, "999999999999999")
+        self.assertEqual(self.outputs(), {first.output_path})
+        self.assertEqual(digest(first.output_path), before)
 
     def test_scale_2000_products_and_10_csv_files_of_1000_rows(self):
         wb = Workbook()

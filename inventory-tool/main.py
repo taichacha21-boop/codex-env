@@ -15,6 +15,8 @@ from typing import Any
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils.cell import range_boundaries
+from openpyxl.worksheet.formula import ArrayFormula
 
 
 MASTER_SHEET = "商品マスタ"
@@ -24,6 +26,9 @@ CSV_HEADERS = ("伝票番号", "明細ID", "商品コード", "区分", "数量"
 HISTORY_HEADERS = ("伝票番号", "明細ID", "日付", "商品コード", "区分", "数量", "処理日時")
 SUMMARY_HEADERS = ("商品コード", "商品名", "現在庫", "今回入庫", "今回出庫", "処理後在庫", "備考")
 ISSUE_HEADERS = ("元ファイル名", "行番号", "内容")
+EXCEL_TEXT_LIMIT = 32767
+# Excelの15桁精度とopenpyxlの数値書込で整数を損失なく保持できる範囲。
+EXCEL_INTEGER_LIMIT = 999_999_999_999_999
 
 
 @dataclass(frozen=True)
@@ -75,7 +80,15 @@ class StopRun(Exception):
 
 
 def _text(value: Any) -> str:
+    if isinstance(value, ArrayFormula):
+        return value.text or f"配列数式（範囲 {value.ref}）"
     return "" if value is None else str(value).strip()
+
+
+def _check_key_length(slip: str, detail: str) -> None:
+    for name, value in (("伝票番号", slip), ("明細ID", detail)):
+        if len(value) > EXCEL_TEXT_LIMIT:
+            raise ValueError(f"{name}は{EXCEL_TEXT_LIMIT}文字以下で指定してください（切り詰め不可）")
 
 
 def _day(value: Any) -> str:
@@ -105,11 +118,16 @@ def _quantity(value: Any) -> int:
     if isinstance(value, int):
         number = value
     elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
-        number = int(value.strip())
+        digits = value.strip().lstrip("0")
+        if len(digits) > 15:
+            raise ValueError(f"数量は1～{EXCEL_INTEGER_LIMIT}の整数（15桁以内）")
+        number = int(digits or "0")
     else:
         raise ValueError("数量は正の整数")
     if number <= 0:
         raise ValueError("数量は正の整数")
+    if number > EXCEL_INTEGER_LIMIT:
+        raise ValueError(f"数量は1～{EXCEL_INTEGER_LIMIT}の整数（15桁以内）")
     return number
 
 
@@ -128,6 +146,12 @@ def _read_master(wb: Any, source: str, errors: list[Issue]) -> tuple[dict[str, P
         raise StopRun
     ws = wb[MASTER_SHEET]
     columns = _headers(ws, MASTER_HEADERS, source, errors)
+    stock_column = columns["現在庫"]
+    array_ranges = []
+    for anchor, reference in ws.array_formulae.items():
+        first_column, first_row, last_column, last_row = range_boundaries(reference)
+        if first_column <= stock_column <= last_column:
+            array_ranges.append((first_row, last_row, _text(ws[anchor].value)))
     products: dict[str, Product] = {}
     duplicate = False
     for row in ws.iter_rows(min_row=2):
@@ -146,11 +170,14 @@ def _read_master(wb: Any, source: str, errors: list[Issue]) -> tuple[dict[str, P
         name_cell = row[columns["商品名"] - 1]
         name = _text(name_cell.value)
         stock_cell = row[columns["現在庫"] - 1]
-        formula = stock_cell.data_type == "f"
+        # アンカー以外は数値／空欄でも配列数式の範囲全体を保護する。
+        array_text = next((text for first, last, text in array_ranges if first <= row_number <= last), None)
+        formula = stock_cell.data_type == "f" or array_text is not None
         problems = []
         if not name:
             problems.append("商品名が空欄")
-        stock = stock_cell.value
+        # 集計用の値に数式オブジェクトを渡さず、元シートのオブジェクトは保持。
+        stock = array_text if array_text is not None else (_text(stock_cell.value) if formula else stock_cell.value)
         if not formula and (
             isinstance(stock, bool)
             or not isinstance(stock, (int, float))
@@ -201,6 +228,7 @@ def _read_history(wb: Any, mode: str, source: str, errors: list[Issue]) -> tuple
                 raise ValueError("必須項目に数式があります")
             if any(not _text(value) for value in values.values()):
                 raise ValueError("必須項目が空欄")
+            _check_key_length(_text(values["伝票番号"]), _text(values["明細ID"]))
             if not isinstance(values["商品コード"], str):
                 raise ValueError("商品コードは文字列である必要があります")
             if _text(values["区分"]) not in ("入庫", "出庫"):
@@ -301,14 +329,18 @@ def _read_transactions(folder: Path, history: dict, result: RunResult) -> list[T
             for name in (*CSV_HEADERS, "日付"):
                 if not fields[name]:
                     problems.append(f"{name}が空欄")
+            try:
+                _check_key_length(*key)
+            except ValueError as exc:
+                problems.append(str(exc))
             if fields["区分"] and fields["区分"] not in ("入庫", "出庫"):
                 problems.append("区分は入庫または出庫")
             try:
                 quantity = _quantity(fields["数量"])
-            except (ValueError, OverflowError):
+            except (ValueError, OverflowError) as exc:
                 quantity = 0
                 if fields["数量"]:
-                    problems.append("数量は正の整数")
+                    problems.append(str(exc))
             try:
                 day = _day(fields["日付"])
             except (ValueError, TypeError, OverflowError):
@@ -391,6 +423,10 @@ def _build_result(wb: Any, products: dict[str, Product], master_columns: dict[st
             if not math.isfinite(after):
                 result.errors.append(Issue(source, product.row, f"商品コード「{code}」の計算結果がExcel数値範囲を超えました"))
                 raise StopRun
+            for label, value in (("現在庫", product.stock), ("今回入庫", incoming), ("今回出庫", outgoing), ("処理後在庫", after)):
+                if abs(value) > EXCEL_INTEGER_LIMIT:
+                    result.errors.append(Issue(source, product.row, f"商品コード「{code}」の{label}が安全な整数範囲（±{EXCEL_INTEGER_LIMIT}）を超えました。実行全体を停止"))
+                    raise StopRun
             master.cell(product.row, master_columns["現在庫"]).value = after
             if after < 0:
                 note = "負在庫（自動補正なし）"
