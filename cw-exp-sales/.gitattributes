@@ -1,0 +1,8 @@
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.bat text eol=crlf
+# BOMやCP932のバイト列を、チェックアウト時にもそのまま維持します。
+*.csv -text whitespace=cr-at-eol
+input_csv/*cp932.csv binary
+*.xlsx binary
