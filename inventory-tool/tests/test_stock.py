@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 
 import main
 
@@ -72,6 +72,24 @@ class StockTests(unittest.TestCase):
         with closing(load_workbook(path)) as wb:
             edit(wb)
             wb.save(path)
+
+    def data_table_master(self, anchor="E3", reference="E3:E4", two_dimensional=False):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "商品マスタ"
+        ws.append(["商品コード", "商品名", "単価", "備考", "現在庫", "計算例"])
+        ws.append(["00125", "商品A", 120, "保持", 100, 12000])
+        ws.append(["00408", "商品B", 350, "保持", 20, 7000])
+        ws.append(["00999", "商品C", 80, "保持", 6, 480])
+        ws["H1"] = 10
+        ws["H2"] = 20
+        formula = DataTableFormula(ref=reference, r1="H1", r2="H2" if two_dimensional else None,
+                                   dt2D=two_dimensional, ca=True)
+        ws[anchor] = formula
+        definition = dict(formula)
+        wb.save(self.master)
+        wb.close()
+        return definition
 
     def stocks(self, path):
         with closing(load_workbook(path, data_only=False)) as wb:
@@ -682,6 +700,93 @@ class StockTests(unittest.TestCase):
             self.assertEqual(wb["集計"]["B2"].value, "=SEQUENCE(2,3)")
             for coordinate in ("B2", "C2", "F2", "C3", "F3"):
                 self.assertEqual(wb["集計"][coordinate].data_type, "s")
+
+    def test_data_table_formula_range_is_excluded_from_stock_and_history(self):
+        definition = self.data_table_master()
+        folder = self.folder([record(code="00999"), record(slip="ANCHOR", code="00408"), record(slip="GOOD", quantity="2")])
+        before = {path: digest(path) for path in (self.master, folder / "data.csv")}
+        first = main.update_stock(self.master, folder, "first")
+        self.assert_success(first)
+        self.assertEqual((first.applied_count, first.errors), (1, []))
+        self.assertEqual([(issue.source_file, issue.row) for issue in first.warnings], [("data.csv", 2), ("data.csv", 3)])
+        history = self.history(first.output_path)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[1][0], "GOOD")
+        description = "データテーブル数式（範囲 E3:E4）"
+        with closing(load_workbook(first.output_path)) as wb:
+            ws = wb["商品マスタ"]
+            self.assertIsInstance(ws["E3"].value, DataTableFormula)
+            self.assertEqual(dict(ws["E3"].value), definition)
+            self.assertEqual(ws["E2"].value, 102)
+            self.assertEqual(ws["E4"].value, 6)
+            for row in (3, 4):
+                for column in (3, 6):
+                    cell = wb["集計"].cell(row, column)
+                    self.assertEqual(cell.value, description)
+                    self.assertEqual(cell.data_type, "s")
+                self.assertEqual(wb["集計"].cell(row, 4).value, 0)
+                self.assertEqual(wb["集計"].cell(row, 7).value, "現在庫が数式のため未更新")
+        saved_hash = digest(first.output_path)
+        second = main.update_stock(first.output_path, folder, "continue")
+        self.assert_success(second)
+        self.assertEqual((second.applied_count, second.duplicate_count, second.errors), (0, 1, []))
+        self.assertEqual(len(second.warnings), 2)
+        self.assertEqual(self.history(second.output_path), history)
+        with closing(load_workbook(second.output_path)) as wb:
+            self.assertEqual(wb["商品マスタ"]["E4"].value, 6)
+            self.assertEqual(dict(wb["商品マスタ"]["E3"].value), definition)
+        self.assertEqual(digest(first.output_path), saved_hash)
+        self.assertEqual(before, {path: digest(path) for path in before})
+
+    def test_data_table_blank_dependent_stock_is_excluded_with_warning(self):
+        self.data_table_master()
+        self.edit_master(lambda wb: setattr(wb["商品マスタ"]["E4"], "value", None))
+        result = main.update_stock(self.master, self.folder([record(code="00999")]), "first")
+        self.assert_success(result)
+        self.assertEqual((result.applied_count, result.errors, len(result.warnings)), (0, [], 2))
+        self.assertEqual(len(self.history(result.output_path)), 1)
+        self.assertTrue(any((issue.source_file, issue.row) == ("data.csv", 2) for issue in result.warnings))
+        with closing(load_workbook(result.output_path)) as wb:
+            self.assertIsNone(wb["商品マスタ"]["E4"].value)
+            self.assertEqual(wb["集計"]["C4"].value, "データテーブル数式（範囲 E3:E4）")
+            self.assertEqual(wb["集計"]["C4"].data_type, "s")
+
+    def test_data_table_anchor_outside_stock_protects_two_dimensional_range(self):
+        definition = self.data_table_master(anchor="D3", reference="D3:F4", two_dimensional=True)
+        result = main.update_stock(self.master, self.folder([record(code="00408"), record(slip="CHILD", code="00999")]), "first")
+        self.assert_success(result)
+        self.assertEqual((result.applied_count, result.errors, len(result.warnings)), (0, [], 2))
+        self.assertEqual(len(self.history(result.output_path)), 1)
+        with closing(load_workbook(result.output_path)) as wb:
+            ws = wb["商品マスタ"]
+            self.assertEqual(dict(ws["D3"].value), definition)
+            for coordinate, value in (("E3", 20), ("E4", 6), ("F3", 7000), ("F4", 480)):
+                self.assertEqual(ws[coordinate].value, value)
+            self.assertEqual(wb["集計"]["C3"].value, "データテーブル数式（範囲 D3:F4）")
+            self.assertEqual(wb["集計"]["F4"].data_type, "s")
+
+    def test_array_and_data_table_ranges_are_protected_together(self):
+        self.data_table_master(anchor="E4", reference="E4:E5")
+        def change(wb):
+            ws = wb["商品マスタ"]
+            ws["E2"] = ArrayFormula(ref="E2:E3", text="=SEQUENCE(2)")
+            for column, value in enumerate(["01000", "商品D", 10, "保持", 8, 80], 1):
+                ws.cell(5, column, value)
+        self.edit_master(change)
+        folder = self.folder([record(slip=f"FORMULA{index}", code=code) for index, code in enumerate(("00125", "00408", "00999", "01000"))])
+        result = main.update_stock(self.master, folder, "first")
+        self.assert_success(result)
+        self.assertEqual((result.applied_count, result.errors, len(result.warnings)), (0, [], 4))
+        self.assertEqual(len(self.history(result.output_path)), 1)
+        with closing(load_workbook(result.output_path)) as wb:
+            ws = wb["商品マスタ"]
+            self.assertEqual(ws.array_formulae, {"E2": "E2:E3"})
+            self.assertIsInstance(ws["E4"].value, DataTableFormula)
+            self.assertEqual(ws["E4"].value.ref, "E4:E5")
+            self.assertEqual((ws["E3"].value, ws["E5"].value), (20, 8))
+            for row in range(2, 6):
+                self.assertEqual(wb["集計"].cell(row, 3).data_type, "s")
+                self.assertEqual(wb["集計"].cell(row, 6).data_type, "s")
 
     def test_key_length_limit_rejects_long_values_without_truncating_or_colliding(self):
         prefix = "K" * 32767

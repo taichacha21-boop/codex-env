@@ -18,7 +18,6 @@ from openpyxl import load_workbook
 from openpyxl.compat.strings import safe_string
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils.cell import range_boundaries
-from openpyxl.worksheet.formula import ArrayFormula
 
 
 MASTER_SHEET = "商品マスタ"
@@ -82,8 +81,14 @@ class StopRun(Exception):
 
 
 def _text(value: Any) -> str:
-    if isinstance(value, ArrayFormula):
-        return value.text or f"配列数式（範囲 {value.ref}）"
+    reference = getattr(value, "ref", None)
+    formula_type = getattr(value, "t", None)
+    if reference is not None and formula_type is not None:
+        text = getattr(value, "text", None)
+        if text:
+            return text
+        label = {"array": "配列数式", "dataTable": "データテーブル数式"}.get(formula_type, "特別数式")
+        return f"{label}（範囲 {reference}）"
     return "" if value is None else str(value).strip()
 
 
@@ -174,11 +179,16 @@ def _read_master(wb: Any, source: str, errors: list[Issue]) -> tuple[dict[str, P
     ws = wb[MASTER_SHEET]
     columns = _headers(ws, MASTER_HEADERS, source, errors)
     stock_column = columns["現在庫"]
-    array_ranges = []
-    for anchor, reference in ws.array_formulae.items():
-        first_column, first_row, last_column, last_row = range_boundaries(reference)
-        if first_column <= stock_column <= last_column:
-            array_ranges.append((first_row, last_row, _text(ws[anchor].value)))
+    formula_ranges = []
+    # 配列数式・What-ifデータテーブル等のrefを共通で扱い、従属セルも保護。
+    for cells in ws.iter_rows():
+        for cell in cells:
+            reference = getattr(cell.value, "ref", None) if cell.data_type == "f" else None
+            if reference is None:
+                continue
+            first_column, first_row, last_column, last_row = range_boundaries(reference)
+            if first_column <= stock_column <= last_column:
+                formula_ranges.append((first_row, last_row, _text(cell.value)))
     products: dict[str, Product] = {}
     duplicate = False
     for row in ws.iter_rows(min_row=2):
@@ -197,14 +207,14 @@ def _read_master(wb: Any, source: str, errors: list[Issue]) -> tuple[dict[str, P
         name_cell = row[columns["商品名"] - 1]
         name = _text(name_cell.value)
         stock_cell = row[columns["現在庫"] - 1]
-        # アンカー以外は数値／空欄でも配列数式の範囲全体を保護する。
-        array_text = next((text for first, last, text in array_ranges if first <= row_number <= last), None)
-        formula = stock_cell.data_type == "f" or array_text is not None
+        # アンカー以外の数値／空欄も、特別数式の定義範囲全体を保護する。
+        range_text = next((text for first, last, text in formula_ranges if first <= row_number <= last), None)
+        formula = stock_cell.data_type == "f" or range_text is not None
         problems = []
         if not name:
             problems.append("商品名が空欄")
         # 集計用の値に数式オブジェクトを渡さず、元シートのオブジェクトは保持。
-        stock = array_text if array_text is not None else (_text(stock_cell.value) if formula else stock_cell.value)
+        stock = range_text if range_text is not None else (_text(stock_cell.value) if formula else stock_cell.value)
         if not formula and (
             isinstance(stock, bool)
             or not isinstance(stock, (int, float))
