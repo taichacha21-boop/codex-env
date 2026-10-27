@@ -10,10 +10,12 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from decimal import Decimal, Inexact, localcontext
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.compat.strings import safe_string
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.worksheet.formula import ArrayFormula
@@ -112,23 +114,48 @@ def _day(value: Any) -> str:
     return parsed.isoformat(sep=" ")
 
 
-def _quantity(value: Any) -> int:
-    if isinstance(value, bool):
-        raise ValueError("数量は正の整数")
-    if isinstance(value, int):
-        number = value
+def _integer_quantity_text(value: Any) -> str:
+    # 上限検証とは独立した比較用整数表記。巨大値もint変換せず正規化する。
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value)
     elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
-        digits = value.strip().lstrip("0")
-        if len(digits) > 15:
-            raise ValueError(f"数量は1～{EXCEL_INTEGER_LIMIT}の整数（15桁以内）")
-        number = int(digits or "0")
-    else:
+        return value.strip().lstrip("0") or "0"
+    raise ValueError("数量は正の整数")
+
+
+def _quantity(value: Any) -> int:
+    digits = _integer_quantity_text(value)
+    if digits == "0":
         raise ValueError("数量は正の整数")
-    if number <= 0:
-        raise ValueError("数量は正の整数")
-    if number > EXCEL_INTEGER_LIMIT:
+    if len(digits) > 15:
         raise ValueError(f"数量は1～{EXCEL_INTEGER_LIMIT}の整数（15桁以内）")
+    return int(digits)
+
+
+def _excel_stock_number(exact: Decimal, label: str) -> int | float:
+    number = int(exact) if exact == exact.to_integral_value() else float(exact)
+    # 固定バージョンのopenpyxlが書く値を、Excel数値の読込と同じ形で検証。
+    # 範囲内でも小数が丸められる場合は、誤った在庫や履歴を保存しない。
+    reloaded = Decimal(str(float(safe_string(number))))
+    if reloaded != exact:
+        raise ValueError(f"{label}をExcelで精度を保って保存できません")
     return number
+
+
+def _stock_after(stock: int | float, incoming: int, outgoing: int) -> int | float:
+    current = Decimal(str(stock))
+    _excel_stock_number(current, "現在庫")
+    net = incoming - outgoing  # 整数同士の差分を先に求め、大きな同額入出庫を相殺。
+    digits = current.as_tuple()
+    # 最小の小数桁から最大の整数桁まで揃えても丸めを起こさない精度を確保。
+    precision = max(len(digits.digits) + max(digits.exponent, 0), len(str(abs(net)))) + max(-digits.exponent, 0) + 1
+    with localcontext() as context:
+        context.prec = precision
+        context.traps[Inexact] = True
+        exact = current + Decimal(net)
+    if exact.copy_abs() > EXCEL_INTEGER_LIMIT:
+        raise ValueError(f"処理後在庫が安全な整数範囲（±{EXCEL_INTEGER_LIMIT}）を超えました")
+    return _excel_stock_number(exact, "処理後在庫")
 
 
 def _headers(ws: Any, required: tuple[str, ...], source: str, errors: list[Issue]) -> dict[str, int]:
@@ -195,7 +222,7 @@ def _read_master(wb: Any, source: str, errors: list[Issue]) -> tuple[dict[str, P
 def _signature(code: Any, kind: Any, quantity: Any, day: Any) -> tuple[Any, ...]:
     # 不正行もキー比較の対象。正常行との食い違いを行エラーとして見逃さない。
     try:
-        normalized_quantity = ("integer", _quantity(quantity))
+        normalized_quantity = ("integer", _integer_quantity_text(quantity))
     except (ValueError, OverflowError):
         normalized_quantity = ("invalid", _text(quantity))
     try:
@@ -419,14 +446,15 @@ def _build_result(wb: Any, products: dict[str, Product], master_columns: dict[st
             if code not in formula_warned:
                 result.warnings.append(Issue(source, product.row, f"商品マスタ: 商品コード「{code}」: {note}"))
         else:
-            after = product.stock + incoming - outgoing
-            if not math.isfinite(after):
-                result.errors.append(Issue(source, product.row, f"商品コード「{code}」の計算結果がExcel数値範囲を超えました"))
-                raise StopRun
-            for label, value in (("現在庫", product.stock), ("今回入庫", incoming), ("今回出庫", outgoing), ("処理後在庫", after)):
+            for label, value in (("現在庫", product.stock), ("今回入庫", incoming), ("今回出庫", outgoing)):
                 if abs(value) > EXCEL_INTEGER_LIMIT:
                     result.errors.append(Issue(source, product.row, f"商品コード「{code}」の{label}が安全な整数範囲（±{EXCEL_INTEGER_LIMIT}）を超えました。実行全体を停止"))
                     raise StopRun
+            try:
+                after = _stock_after(product.stock, incoming, outgoing)
+            except ValueError as exc:
+                result.errors.append(Issue(source, product.row, f"商品コード「{code}」: {exc}。実行全体を停止"))
+                raise StopRun from exc
             master.cell(product.row, master_columns["現在庫"]).value = after
             if after < 0:
                 note = "負在庫（自動補正なし）"

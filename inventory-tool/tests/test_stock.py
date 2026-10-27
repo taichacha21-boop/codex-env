@@ -10,6 +10,7 @@ import unittest
 from contextlib import closing
 from copy import copy
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
@@ -796,6 +797,79 @@ class StockTests(unittest.TestCase):
         self.assert_stopped(result, "999999999999999")
         self.assertEqual(self.outputs(), {first.output_path})
         self.assertEqual(digest(first.output_path), before)
+
+    def test_fractional_stock_survives_equal_large_receipt_and_issue(self):
+        maximum = "999999999999999"
+        for initial in ("0.01", "-0.01", "0.001", "0.1"):
+            with self.subTest(initial=initial):
+                self.edit_master(lambda wb: setattr(wb["商品マスタ"]["C2"], "value", float(initial)))
+                folder = self.folder([record(quantity=maximum), record(slip="OUT", kind="出庫", quantity=maximum)])
+                before = {path: digest(path) for path in (self.master, folder / "data.csv")}
+                first = main.update_stock(self.master, folder, "first")
+                self.assert_success(first)
+                self.assertEqual((first.applied_count, first.errors), (2, []))
+                self.assertEqual(Decimal(str(self.stocks(first.output_path)["00125"])), Decimal(initial))
+                with closing(load_workbook(first.output_path)) as wb:
+                    self.assertEqual(Decimal(str(wb["集計"]["F2"].value)), Decimal(initial))
+                    self.assertEqual(wb["集計"]["D2"].value, int(maximum))
+                    self.assertEqual(wb["集計"]["E2"].value, int(maximum))
+                self.assertEqual(len(self.history(first.output_path)), 3)
+                second = main.update_stock(first.output_path, folder, "continue")
+                self.assert_success(second)
+                self.assertEqual((second.applied_count, second.duplicate_count), (0, 2))
+                self.assertEqual(Decimal(str(self.stocks(second.output_path)["00125"])), Decimal(initial))
+                self.assertEqual(self.history(first.output_path), self.history(second.output_path))
+                self.assertEqual(before, {path: digest(path) for path in before})
+
+    def test_fractional_stock_with_small_net_of_large_movements_is_exact(self):
+        self.edit_master(lambda wb: setattr(wb["商品マスタ"]["C2"], "value", 0.01))
+        for incoming, outgoing, expected in (
+            ("999999999999999", "999999999999998", "1.01"),
+            ("999999999999998", "999999999999999", "-0.99"),
+        ):
+            with self.subTest(expected=expected):
+                folder = self.folder([record(quantity=incoming), record(slip="OUT", kind="出庫", quantity=outgoing)])
+                result = main.update_stock(self.master, folder, "first")
+                self.assert_success(result)
+                self.assertEqual((result.applied_count, result.errors), (2, []))
+                self.assertEqual(Decimal(str(self.stocks(result.output_path)["00125"])), Decimal(expected))
+                self.assertEqual(len(self.history(result.output_path)), 3)
+
+    def test_fractional_result_that_excel_would_round_is_not_published(self):
+        for initial, quantity in ((0.01, "100000000000000"), (0.001, "10000000000000")):
+            with self.subTest(initial=initial, quantity=quantity):
+                self.edit_master(lambda wb: setattr(wb["商品マスタ"]["C2"], "value", initial))
+                folder = self.folder([record(quantity=quantity), record(slip="GOOD", code="00408")])
+                before = {path: digest(path) for path in (self.master, folder / "data.csv")}
+                result = main.update_stock(self.master, folder, "first")
+                self.assert_stopped(result, "精度")
+                self.assertEqual(self.outputs(), set())
+                self.assertEqual(before, {path: digest(path) for path in before})
+
+    def test_equal_over_limit_quantities_are_normalized_before_key_comparison(self):
+        for quantity in ("1000000000000000", "9" * 5000):
+            with self.subTest(digits=len(quantity)):
+                folder = self.folder([record(quantity=quantity), record(quantity="0" + quantity), record(slip="GOOD", code="00408")])
+                first = main.update_stock(self.master, folder, "first")
+                self.assert_success(first)
+                self.assertEqual((first.applied_count, len(first.errors)), (1, 2))
+                self.assertEqual([issue.row for issue in first.errors], [2, 3])
+                self.assertFalse(any("矛盾" in issue.message for issue in first.errors))
+                self.assertEqual(self.stocks(first.output_path)["00125"], 100)
+                self.assertEqual(self.stocks(first.output_path)["00408"], 25)
+                self.assertEqual(len(self.history(first.output_path)), 2)
+                second = main.update_stock(first.output_path, folder, "continue")
+                self.assert_success(second)
+                self.assertEqual((second.applied_count, second.duplicate_count, len(second.errors)), (0, 1, 2))
+                self.assertEqual(self.history(first.output_path), self.history(second.output_path))
+
+    def test_different_over_limit_integer_quantities_still_abort_entire_run(self):
+        folder = self.folder([record(quantity="1000000000000000"), record(quantity="01000000000000001"), record(slip="GOOD", code="00408")])
+        before = digest(self.master)
+        result = main.update_stock(self.master, folder, "first")
+        self.assert_stopped(result, "矛盾")
+        self.assertEqual(self.outputs(), set())
+        self.assertEqual(digest(self.master), before)
 
     def test_scale_2000_products_and_10_csv_files_of_1000_rows(self):
         wb = Workbook()
